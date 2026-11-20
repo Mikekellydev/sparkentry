@@ -162,6 +162,10 @@
   .mileage-total.has-value .mt-hint{width:auto}
   .mileage-total.is-error{border-color:var(--danger);background:var(--danger-bg)}
   .mileage-total.is-error .mt-label,.mileage-total.is-error .mt-hint{color:var(--danger)}
+  .trip-banner{border:1.5px solid var(--accent);background:var(--accent-soft);border-radius:12px;padding:12px 14px;margin:0 0 12px}
+  .trip-banner .trip-title{font-size:13px;font-weight:800;letter-spacing:.02em;color:var(--accent-dark);text-transform:uppercase}
+  @media (prefers-color-scheme: dark){ .trip-banner .trip-title{color:var(--accent)} }
+  .trip-banner .trip-detail{font-size:15px;color:var(--ink);margin:5px 0 9px;line-height:1.4}
   .field-hint{font-size:13.5px;color:var(--muted);margin:0 0 14px;line-height:1.45}
   .odo-detail{
     display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:7px;
@@ -389,7 +393,12 @@
             <span class="mt-value tnum" id="mileageTotal">—</span>
             <span class="mt-hint" id="mileageHint">Enter start and stop — miles total themselves</span>
           </div>
-          <p class="field-hint">Just the two readings. The total is stop minus start, figured as soon as you enter the stop reading.</p>
+          <div id="tripBanner" class="trip-banner hidden" aria-live="polite">
+            <div class="trip-title">Trip in progress</div>
+            <div class="trip-detail tnum" id="tripDetail"></div>
+            <button type="button" class="mini-btn danger" id="cancelTripBtn">Cancel trip</button>
+          </div>
+          <p class="field-hint">Start when you leave, stop when you arrive — the start is saved on this device, so it waits even if the app closes. Or enter both readings at once for a past trip.</p>
         </div>
         <div class="field">
           <label for="fNote">Note <span style="font-weight:400;color:var(--muted)">(optional — client, receipt no., paid how)</span></label>
@@ -490,6 +499,8 @@
 (function(){
   "use strict";
   var KEY = "expense-capture-v1";
+  var TRIP_KEY = "expense-capture-trip-v1";
+  var activeTrip = null;
   var entries = [];
   var editingId = null;
   var confirmingDelete = null;
@@ -506,6 +517,7 @@
     fOdoStart: $("fOdoStart"), fOdoEnd: $("fOdoEnd"),
     standardFields: $("standardFields"), mileageFields: $("mileageFields"),
     mileageTotalBox: $("mileageTotalBox"), mileageTotal: $("mileageTotal"), mileageHint: $("mileageHint"),
+    tripBanner: $("tripBanner"), tripDetail: $("tripDetail"), cancelTripBtn: $("cancelTripBtn"),
     formErr: $("formErr"), formTitle: $("formTitle"), saveBtnText: $("saveBtnText"),
     editingNote: $("editingNote"), cancelEdit: $("cancelEdit"),
     generateBtn: $("generateBtn"), genCount: $("genCount"),
@@ -533,6 +545,22 @@
   }
   function save(){
     try{ localStorage.setItem(KEY, JSON.stringify(entries)); return true; }catch(e){ return false; }
+  }
+  function loadTrip(){
+    try{
+      var raw = localStorage.getItem(TRIP_KEY);
+      if(raw){
+        var t = JSON.parse(raw);
+        if(t && !isNaN(parseFloat(t.odoStart))) activeTrip = t; else activeTrip = null;
+      } else activeTrip = null;
+    }catch(e){ activeTrip = null; }
+  }
+  function saveTrip(){
+    try{
+      if(activeTrip) localStorage.setItem(TRIP_KEY, JSON.stringify(activeTrip));
+      else localStorage.removeItem(TRIP_KEY);
+      return true;
+    }catch(e){ return false; }
   }
   function updatePhotoUI(){
     var has = !!currentPhoto;
@@ -661,6 +689,33 @@
     els.mileageFields.classList.toggle("hidden", !mileage);
     els.fWhat.placeholder = mileage ? "e.g. Client visit" : "e.g. Fuel for the truck";
     if(mileage) updateMileageTotal();
+    renderTripUI();
+  }
+  function updateSaveBtnLabel(){
+    if(editingId){ els.saveBtnText.textContent = "Save changes"; return; }
+    if(isMileageCategory(els.fCat.value)){
+      if(activeTrip){ els.saveBtnText.textContent = "Finish trip"; return; }
+      var sRaw = els.fOdoStart.value.trim();
+      var eRaw = els.fOdoEnd.value.trim();
+      if(sRaw && !eRaw){ els.saveBtnText.textContent = "Start trip"; return; }
+    }
+    els.saveBtnText.textContent = "Add entry";
+  }
+  function renderTripUI(){
+    var isMileage = isMileageCategory(els.fCat.value);
+    var hasTrip = !!activeTrip && !editingId;
+    els.tripBanner.classList.toggle("hidden", !hasTrip || !isMileage);
+    if(hasTrip){
+      els.tripDetail.textContent = "Started " + fmtDate(activeTrip.date) + " \u00b7 odometer " + fmtOdo(activeTrip.odoStart) + (activeTrip.what ? " \u00b7 " + activeTrip.what : "");
+      els.fOdoStart.value = activeTrip.odoStart;
+      els.fOdoStart.disabled = true;
+      if(els.fWhat.value.trim() === "") els.fWhat.value = activeTrip.what || "";
+      if(!els.fDate.value) els.fDate.value = activeTrip.date || todayLocal();
+    } else {
+      els.fOdoStart.disabled = false;
+    }
+    updateMileageTotal();
+    updateSaveBtnLabel();
   }
   function esc(s){
     return String(s==null?"":s).replace(/[&<>"']/g, function(c){
@@ -803,6 +858,7 @@
     var what = els.fWhat.value.trim();
     var isMileage = isMileageCategory(els.fCat.value);
     var amount = 0, miles = 0, odoStart = null, odoEnd = null;
+    var finishingTrip = false;
 
     if(!els.fDate.value){ showErr("Pick a date for this entry."); return; }
     if(!what){ showErr("Say what it was — even two or three words."); els.fWhat.focus(); return; }
@@ -810,12 +866,32 @@
     if(isMileage){
       var s = parseFloat(els.fOdoStart.value);
       var e2 = parseFloat(els.fOdoEnd.value);
-      if(els.fOdoStart.value.trim() === "" || isNaN(s)){ showErr("Enter the start odometer reading."); els.fOdoStart.focus(); return; }
-      if(els.fOdoEnd.value.trim() === "" || isNaN(e2)){ showErr("Enter the stop odometer reading — the total figures itself from there."); els.fOdoEnd.focus(); return; }
-      var diff = Math.round((e2 - s)*10)/10;
-      if(diff < 0){ showErr("Stop odometer is lower than start — check the two readings."); els.fOdoEnd.focus(); return; }
-      if(diff === 0){ showErr("Start and stop are the same, so that's 0 miles. Check the readings."); els.fOdoEnd.focus(); return; }
-      odoStart = s; odoEnd = e2; miles = diff; amount = 0;
+      if(activeTrip && !editingId){
+        /* Finish trip: the start comes from the saved trip. Only the stop is needed. */
+        s = parseFloat(activeTrip.odoStart);
+        if(els.fOdoEnd.value.trim() === "" || isNaN(e2)){ showErr("Enter the stop odometer reading to finish the trip."); els.fOdoEnd.focus(); return; }
+        var diffF = Math.round((e2 - s)*10)/10;
+        if(diffF < 0){ showErr("Stop odometer is lower than start — check the reading."); els.fOdoEnd.focus(); return; }
+        if(diffF === 0){ showErr("Start and stop are the same, so that's 0 miles. Check the reading."); els.fOdoEnd.focus(); return; }
+        odoStart = s; odoEnd = e2; miles = diffF; amount = 0;
+        finishingTrip = true;
+      } else if(!editingId && els.fOdoEnd.value.trim() === "" && els.fOdoStart.value.trim() !== "" && !isNaN(s)){
+        /* Start trip: only the start is filled. Save the trip and wait for the stop. */
+        activeTrip = { odoStart: s, what: what, date: els.fDate.value, note: els.fNote.value.trim(), startedAt: Date.now() };
+        saveTrip();
+        renderTripUI(); render();
+        toast("Trip started — " + fmtOdo(s) + ". Add the stop when you arrive.");
+        els.fOdoEnd.focus();
+        return;
+      } else {
+        /* Both readings at once (a past trip), or editing an existing entry. */
+        if(els.fOdoStart.value.trim() === "" || isNaN(s)){ showErr("Enter the start odometer reading."); els.fOdoStart.focus(); return; }
+        if(els.fOdoEnd.value.trim() === "" || isNaN(e2)){ showErr("Enter the stop odometer reading — the total figures itself from there."); els.fOdoEnd.focus(); return; }
+        var diff = Math.round((e2 - s)*10)/10;
+        if(diff < 0){ showErr("Stop odometer is lower than start — check the two readings."); els.fOdoEnd.focus(); return; }
+        if(diff === 0){ showErr("Start and stop are the same, so that's 0 miles. Check the readings."); els.fOdoEnd.focus(); return; }
+        odoStart = s; odoEnd = e2; miles = diff; amount = 0;
+      }
     } else {
       amount = parseFloat(els.fAmount.value);
       miles = parseFloat(els.fMiles.value);
@@ -847,7 +923,9 @@
         photo: currentPhoto || null,
         entered: false, enteredAt: null, createdAt: Date.now()
       });
-      var savedNew = save(); render();
+      var savedNew = save();
+      if(finishingTrip){ activeTrip = null; saveTrip(); }
+      render();
       var keptDate = els.fDate.value, keptCat = els.fCat.value;
       resetForm(false);
       els.fDate.value = keptDate; els.fCat.value = keptCat;
@@ -868,12 +946,19 @@
   document.addEventListener("keydown", function(ev){ if(ev.key === "Escape" && !els.lightbox.classList.contains("hidden")) closeLightbox(); });
 
   els.fCat.addEventListener("change", function(){ updateCategoryFields(); });
-  els.fOdoStart.addEventListener("input", updateMileageTotal);
-  els.fOdoEnd.addEventListener("input", updateMileageTotal);
-  els.fOdoStart.addEventListener("change", updateMileageTotal);
-  els.fOdoEnd.addEventListener("change", updateMileageTotal);
+  els.fOdoStart.addEventListener("input", function(){ updateMileageTotal(); updateSaveBtnLabel(); });
+  els.fOdoEnd.addEventListener("input", function(){ updateMileageTotal(); updateSaveBtnLabel(); });
+  els.fOdoStart.addEventListener("change", function(){ updateMileageTotal(); updateSaveBtnLabel(); });
+  els.fOdoEnd.addEventListener("change", function(){ updateMileageTotal(); updateSaveBtnLabel(); });
 
   els.cancelEdit.addEventListener("click", function(){ resetForm(false); });
+  els.cancelTripBtn.addEventListener("click", function(){
+    if(!activeTrip) return;
+    if(!window.confirm("Cancel this trip? The start reading will be discarded.")) return;
+    activeTrip = null; saveTrip();
+    resetForm(false); render();
+    toast("Trip cancelled");
+  });
   els.generateBtn.addEventListener("click", function(){
     render();
     if(pending().length === 0){ toast("Nothing waiting — you're all caught up"); }
@@ -1017,7 +1102,16 @@
   });
 
   load();
-  els.fDate.value = todayLocal();
+  loadTrip();
+  if(activeTrip){
+    els.fCat.value = "Mileage / Travel";
+    els.fWhat.value = activeTrip.what || "";
+    els.fDate.value = activeTrip.date || todayLocal();
+    els.fNote.value = activeTrip.note || "";
+    els.fOdoStart.value = activeTrip.odoStart;
+  } else {
+    els.fDate.value = todayLocal();
+  }
   updateCategoryFields();
   updatePhotoUI();
   render();
